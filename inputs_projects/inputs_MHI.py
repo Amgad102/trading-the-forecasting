@@ -22,6 +22,12 @@ number_years_to_calculate = 1
 is_cost_driven = False
 electricity_price_forecasting = False
 
+## FORECASTING SETTINGS (used when electricity_price_forecasting = True):
+forecast_file = "G_T_all_hourly_forecasts_168h_model_no_feb29.csv"
+targets_file = "targets.csv"
+forecast_column = "G1"
+target_column = "T"
+
 ## SYSTEM GENERAL SPECIFICATIONS:
 unit = "kg H2"
 resource_consumption_power = 59.1 ## MWhe

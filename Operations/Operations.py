@@ -17,6 +17,9 @@ from P2P.main_ext import RunMain as P2P_RunMain
 from inputs import price_mean_modifier, price_std_modifier, price_minimum , PPA,  PPA_sales, storage_capacity, PROJECT_LIFETIME, YEAR_START, rss_day_0, subsidy_per_mwh, tension_level, electricity_price_forecasting, sample_period_days
 import inputs
 
+if electricity_price_forecasting:
+    from MainData.ForecastPriceData import ForecastPriceData
+
 
 class Operations(object):
 
@@ -98,6 +101,13 @@ class Operations(object):
         self._margin_tradingcompany_power = inputs.margin_tradingcompany_power
         self._electricity_price_data_obj = ElectricityPriceData(self._project_life, price_mean_modifier, price_std_modifier, price_minimum , PPA, subsidy_per_mwh, PPA_sales)
         self._weather_data_obj = WeatherData( self._project_year_start, self._project_life)
+
+        ## Load forecast/target data when forecasting is enabled
+        if electricity_price_forecasting:
+            self._forecast_price_data_obj = ForecastPriceData(
+                self._electricity_price_data_obj.get_electricity_price_df(),
+                self._project_life
+            )
         
         ## initialize trading and retrieve necessary data
         #TODO: definir bypass_variables
@@ -186,7 +196,12 @@ class Operations(object):
         if PPA is not None:
             self._electricity_price_data_obj.update_spot_price1_PPA_from_weather_df(PPA, weather_data_df)
         electricity_price_df = self._electricity_price_data_obj.get_electricity_price_df()
-        
+
+        ## Pre-load forecast/settlement DataFrames when forecasting is enabled
+        if electricity_price_forecasting:
+            decision_price_df_full = self._forecast_price_data_obj.get_decision_price_df()
+            settlement_price_df_full = self._forecast_price_data_obj.get_settlement_price_df()
+
         #for year_count in range(self._project_life):
         for year_count in range(self._number_years_to_calculate):
             print('Computing year {}/{}. Total project lifetime of {} years.'.format(year_count+1, self._number_years_to_calculate, self._project_life))
@@ -195,16 +210,25 @@ class Operations(object):
             rps_efficiency = self._p2p_main_obj.get_rps_efficiency() if self._p2p_main_obj.get_rps_efficiency() else rps_efficiency
             rcs_efficiency = self._p2p_main_obj.get_rcs_efficiency() if self._p2p_main_obj.get_rcs_efficiency() else rcs_efficiency
 
+            year = self._project_year_start + year_count
             ## get only the price data for the relevant year + the subsiquent year (this takes into account the transition at the end of each year)
-            electricity_price_period_df = electricity_price_df[(electricity_price_df.Year ==self._project_year_start + year_count) | (electricity_price_df.Year == self._project_year_start + year_count + 1)].reset_index(drop=True)
+            electricity_price_period_df = electricity_price_df[(electricity_price_df.Year == year) | (electricity_price_df.Year == year + 1)].reset_index(drop=True)
             #weather_data_period_df = weather_data_df[(electricity_price_df.Year ==self._project_year_start + year_count) | (electricity_price_df.Year == self._project_year_start + year_count + 1)].reset_index(drop=True)
-            weather_data_period_df = weather_data_df[(weather_data_df.Year == self._project_year_start + year_count) |     (weather_data_df.Year == self._project_year_start + year_count + 1)].reset_index(drop=True)
+            weather_data_period_df = weather_data_df[(weather_data_df.Year == year) | (weather_data_df.Year == year + 1)].reset_index(drop=True)
             if isinstance(resource_input_flow_df, list) and not resource_input_flow_df:
                 resource_input_flow_period_df = []
             else:
-                resource_input_flow_period_df = resource_input_flow_df[(resource_input_flow_df.Year == self._project_year_start + year_count) |     (resource_input_flow_df.Year == self._project_year_start + year_count + 1)].reset_index(drop=True)
+                resource_input_flow_period_df = resource_input_flow_df[(resource_input_flow_df.Year == year) | (resource_input_flow_df.Year == year + 1)].reset_index(drop=True)
 
-            annual_operations_df = self._calculate_annual_operation_df(electricity_price_period_df, resource_input_flow_period_df, weather_data_period_df, rss_start, rps_efficiency, rcs_efficiency,rps_efficiency_bypass, rcs_efficiency_bypass)
+            ## Extract forecast/settlement period DataFrames for this year when forecasting
+            if electricity_price_forecasting:
+                decision_price_period_df = decision_price_df_full[(decision_price_df_full.Year == year) | (decision_price_df_full.Year == year + 1)].reset_index(drop=True)
+                settlement_price_period_df = settlement_price_df_full[(settlement_price_df_full.Year == year) | (settlement_price_df_full.Year == year + 1)].reset_index(drop=True)
+            else:
+                decision_price_period_df = None
+                settlement_price_period_df = None
+
+            annual_operations_df = self._calculate_annual_operation_df(electricity_price_period_df, resource_input_flow_period_df, weather_data_period_df, rss_start, rps_efficiency, rcs_efficiency, rps_efficiency_bypass, rcs_efficiency_bypass, decision_price_period_df, settlement_price_period_df)
             project_operation_df = pd.concat([project_operation_df, annual_operations_df]).reset_index(drop=True)
             rss_start = project_operation_df['rss'].iloc[-1]
             
@@ -212,18 +236,32 @@ class Operations(object):
         return project_operation_df
 
 
-    def _calculate_annual_operation_df(self, electricity_price_df, resource_input_flow_df, weather_data_df, rss_year_day_0, rps_efficiency, rcs_efficiency,rps_efficiency_bypass, rcs_efficiency_bypass):
+    def _calculate_annual_operation_df(self, electricity_price_df, resource_input_flow_df, weather_data_df, rss_year_day_0, rps_efficiency, rcs_efficiency, rps_efficiency_bypass, rcs_efficiency_bypass, decision_price_df=None, settlement_price_df=None):
+        """
+        Parameters
+        ----------
+        electricity_price_df : pd.DataFrame
+            Actual (base) electricity prices for the year. Used for decisions when
+            forecasting is disabled, and also joined at the end for settlement columns.
+        decision_price_df : pd.DataFrame or None
+            Forecast-based prices for trading decisions. When provided (forecasting
+            enabled), replaces electricity_price_df for the sample_period_df window
+            passed to Trading.run(). Spot_Price1 contains DA forecast values.
+        settlement_price_df : pd.DataFrame or None
+            Target (actual) prices for cashflow settlement. When provided, used for
+            the final join that populates Spot_Price1/Spot_Price2 in annual_operations_df.
+        """
         annual_operation_df = pd.DataFrame()
         annual_consolidated_resource_inlet_flow_list = []
         annual_consolidated_resource_inlet_power_consumption_list = []
-        
+
         rss_start = rss_year_day_0
         time1 = time.time()
-        
+
         for day_count in progressbar(range(365), "Computing Daily operations: ", 36):
         ## for day_count in range(365):
             ## call Trading class
-            
+
             start = day_count * 24
             end = day_count * 24 + sample_period_days * 24
             if isinstance(resource_input_flow_df, list) and not resource_input_flow_df:
@@ -232,9 +270,9 @@ class Operations(object):
                 resource_input_flow_sample_df = resource_input_flow_df[(resource_input_flow_df.index >= start) & (resource_input_flow_df.index < end)]
             weather_data_sample_df = weather_data_df[(weather_data_df.index >= start) & (weather_data_df.index < end)]
 
-            if electricity_price_forecasting == True:    
-                # Run forcasting (from day_count inpot the forcasted_period_df) AMGAD
-                sample_period_df = []
+            if electricity_price_forecasting and decision_price_df is not None:
+                # Use DA forecast prices for trading decisions
+                sample_period_df = decision_price_df[(decision_price_df.index >= start) & (decision_price_df.index < end)]
             else:
                 sample_period_df = electricity_price_df[(electricity_price_df.index >= start) & (electricity_price_df.index < end)]
 
@@ -261,7 +299,9 @@ class Operations(object):
 
         print('Finalizing annual operations...',  end='\r')
         print(min(annual_consolidated_resource_inlet_flow_list))
-        annual_operations_df = self._calculate_aggregated_operations_df(annual_operation_df.copy(), annual_consolidated_resource_inlet_flow_list, annual_consolidated_resource_inlet_power_consumption_list, weather_data_df, rss_year_day_0).join(electricity_price_df)
+        # For cashflow settlement: use target prices when forecasting, actual prices otherwise
+        price_df_for_settlement = settlement_price_df if (electricity_price_forecasting and settlement_price_df is not None) else electricity_price_df
+        annual_operations_df = self._calculate_aggregated_operations_df(annual_operation_df.copy(), annual_consolidated_resource_inlet_flow_list, annual_consolidated_resource_inlet_power_consumption_list, weather_data_df, rss_year_day_0).join(price_df_for_settlement)
         water_consumption_list_rcs = self._p2p_main_obj.get_water_consumption_from_rcs() #m3/h
         annual_operations_df["water_consumption_rcs"] = water_consumption_list_rcs
         fuel_consumption_list_rcs = self._p2p_main_obj.get_fuel_consumption_from_rcs() #MWh/h

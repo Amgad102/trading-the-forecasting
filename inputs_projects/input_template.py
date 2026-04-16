@@ -26,6 +26,18 @@ number_years_to_calculate = 1
 is_cost_driven = False
 electricity_price_forecasting = False
 
+## FORECASTING SETTINGS (used when electricity_price_forecasting = True):
+# Default files: 168h DA forecast and targets.
+# The forecast_file should be placed in the MainData/ folder.
+# forecast_column: column in forecast_file used for trading decisions (e.g. "G1", "G4", "T")
+# target_column:   column in targets_file used for settlement (actual price, e.g. "T")
+# sample_period_days: how many days ahead the trader looks per window (1–7 for 168h file; 1 for 24h file)
+forecast_file = "G_T_all_hourly_forecasts_168h_model_no_feb29.csv"
+targets_file = "targets.csv"
+forecast_column = "G1"   ## column from forecast_file for decisions
+target_column = "T"      ## column from targets_file for settlement
+## Note: override sample_period_days = 1 (default for forecasting, 1–7 valid for 168h file)
+
 ## SYSTEM GENERAL SPECIFICATIONS:
 unit = "kg H2"
 resource_consumption_power = 59.1 ## MWhe
