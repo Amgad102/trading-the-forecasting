@@ -21,6 +21,11 @@ sample_period_days  = 7
 number_years_to_calculate = 1
 is_cost_driven = False
 electricity_price_forecasting = False
+## FORECASTING PARAMETERS (used when electricity_price_forecasting = True):
+forecast_file = 'G_T_all_hourly_forecasts_168h_model_no_feb29.csv'  ## forecast CSV in MainData/
+targets_file = 'targets.csv'                                          ## targets CSV in MainData/
+forecast_column = 'T1'   ## column from forecast_file used for decisions (e.g., T1, G1, G4 for 168h; DA_forecast for 24h)
+targets_column = 'DA'    ## column from targets_file used for settlement
 
 ## SYSTEM GENERAL SPECIFICATIONS:
 unit = "kg H2"

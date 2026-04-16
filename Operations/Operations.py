@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import time
@@ -98,6 +99,11 @@ class Operations(object):
         self._margin_tradingcompany_power = inputs.margin_tradingcompany_power
         self._electricity_price_data_obj = ElectricityPriceData(self._project_life, price_mean_modifier, price_std_modifier, price_minimum , PPA, subsidy_per_mwh, PPA_sales)
         self._weather_data_obj = WeatherData( self._project_year_start, self._project_life)
+
+        ## Load forecasting data if enabled
+        if electricity_price_forecasting:
+            self._forecast_by_window, self._forecast_min_year, self._forecast_max_year = self._load_forecast_df()
+            self._targets_df = self._load_targets_df()
         
         ## initialize trading and retrieve necessary data
         #TODO: definir bypass_variables
@@ -216,14 +222,19 @@ class Operations(object):
         annual_operation_df = pd.DataFrame()
         annual_consolidated_resource_inlet_flow_list = []
         annual_consolidated_resource_inlet_power_consumption_list = []
-        
+
         rss_start = rss_year_day_0
         time1 = time.time()
-        
+
+        ## Pre-compute settlement price df and simulation year for forecasting
+        if electricity_price_forecasting:
+            simulation_year = int(electricity_price_df['Year'].iloc[0])
+            settlement_price_df = self._build_settlement_price_df(electricity_price_df)
+
         for day_count in progressbar(range(365), "Computing Daily operations: ", 36):
         ## for day_count in range(365):
             ## call Trading class
-            
+
             start = day_count * 24
             end = day_count * 24 + sample_period_days * 24
             if isinstance(resource_input_flow_df, list) and not resource_input_flow_df:
@@ -232,9 +243,8 @@ class Operations(object):
                 resource_input_flow_sample_df = resource_input_flow_df[(resource_input_flow_df.index >= start) & (resource_input_flow_df.index < end)]
             weather_data_sample_df = weather_data_df[(weather_data_df.index >= start) & (weather_data_df.index < end)]
 
-            if electricity_price_forecasting == True:    
-                # Run forcasting (from day_count inpot the forcasted_period_df) AMGAD
-                sample_period_df = []
+            if electricity_price_forecasting:
+                sample_period_df = self._build_forecast_sample_period_df(electricity_price_df, day_count, start, end, simulation_year)
             else:
                 sample_period_df = electricity_price_df[(electricity_price_df.index >= start) & (electricity_price_df.index < end)]
 
@@ -261,7 +271,8 @@ class Operations(object):
 
         print('Finalizing annual operations...',  end='\r')
         print(min(annual_consolidated_resource_inlet_flow_list))
-        annual_operations_df = self._calculate_aggregated_operations_df(annual_operation_df.copy(), annual_consolidated_resource_inlet_flow_list, annual_consolidated_resource_inlet_power_consumption_list, weather_data_df, rss_year_day_0).join(electricity_price_df)
+        price_df_for_settlement = settlement_price_df if electricity_price_forecasting else electricity_price_df
+        annual_operations_df = self._calculate_aggregated_operations_df(annual_operation_df.copy(), annual_consolidated_resource_inlet_flow_list, annual_consolidated_resource_inlet_power_consumption_list, weather_data_df, rss_year_day_0).join(price_df_for_settlement)
         water_consumption_list_rcs = self._p2p_main_obj.get_water_consumption_from_rcs() #m3/h
         annual_operations_df["water_consumption_rcs"] = water_consumption_list_rcs
         fuel_consumption_list_rcs = self._p2p_main_obj.get_fuel_consumption_from_rcs() #MWh/h
@@ -440,6 +451,141 @@ class Operations(object):
         return new_list
 
     
+    # ------------------------------------------------------------------
+    # Forecasting helpers
+    # ------------------------------------------------------------------
+
+    def _load_forecast_df(self):
+        """Load forecast CSV and return (lookup_dict, min_year, max_year).
+
+        The lookup dict maps window_start string 'YYYY-MM-DD' → DataFrame of
+        forecast rows for that window (up to 168 rows for the 168h file).
+        """
+        forecast_path = os.path.join("MainData", inputs.forecast_file)
+        df = pd.read_csv(forecast_path)
+        df['window_start'] = pd.to_datetime(df['window_start'])
+        min_year = int(df['window_start'].dt.year.min())
+        max_year = int(df['window_start'].dt.year.max())
+        df['_ws_str'] = df['window_start'].dt.strftime('%Y-%m-%d')
+        forecast_by_window = {ws: grp.reset_index(drop=True) for ws, grp in df.groupby('_ws_str')}
+        return forecast_by_window, min_year, max_year
+
+    def _load_targets_df(self):
+        """Load targets CSV, parse datetime, add Year/Month/Day/Hour columns, remove Feb 29."""
+        targets_path = os.path.join("MainData", inputs.targets_file)
+        df = pd.read_csv(targets_path)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df['Year'] = df['datetime'].dt.year
+        df['Month'] = df['datetime'].dt.month
+        df['Day'] = df['datetime'].dt.day
+        df['Hour'] = df['datetime'].dt.hour
+        # Remove Feb 29 to align with forecast calendar (no Feb 29 in forecast files)
+        df = df[~((df['Month'] == 2) & (df['Day'] == 29))].reset_index(drop=True)
+        return df
+
+    def _apply_price_markup(self, raw_prices, base_df):
+        """Apply the same electricity cost markup used in ElectricityPriceData.
+
+        If EnergyTermTolls / EnergyTermOtherCharges columns are present in
+        base_df they are included; otherwise only the margin and tax apply.
+        """
+        margin = inputs.margin_tradingcompany_energy  # EUR/kWh → multiplied by 1000 for EUR/MWh
+        tax_factor = 1 + inputs.electricity_tax / 100
+        if 'EnergyTermTolls' in base_df.columns and 'EnergyTermOtherCharges' in base_df.columns:
+            tolls = base_df['EnergyTermTolls'].values * 1000
+            other = base_df['EnergyTermOtherCharges'].values * 1000
+            return (raw_prices + tolls + other + margin * 1000) * tax_factor
+        return (raw_prices + margin * 1000) * tax_factor
+
+    def _map_simulation_year(self, simulation_year, min_year, max_year):
+        """Clamp simulation_year to the available data range, repeating last year if needed."""
+        return min(int(simulation_year), max_year)
+
+    def _build_forecast_sample_period_df(self, electricity_price_df, day_count, start, end, simulation_year):
+        """Return a sample_period_df where Spot_Price1/Spot_Price2 are replaced by
+        forecast values (marked up). Non-price columns are taken from electricity_price_df
+        to preserve TariffPeriod, Year/Month/Day/Hour, etc.
+        """
+        # Map to available forecast year (repeat last year for years beyond range)
+        effective_year = self._map_simulation_year(simulation_year, self._forecast_min_year, self._forecast_max_year)
+        sim_date_in_year = pd.Timestamp(int(simulation_year), 1, 1) + pd.Timedelta(days=day_count)
+        try:
+            effective_date = sim_date_in_year.replace(year=effective_year)
+        except ValueError:
+            # Feb 29 guard (should not occur since Feb 29 is skipped in the loop calendar)
+            effective_date = sim_date_in_year.replace(year=effective_year, day=28)
+
+        ws_key = effective_date.strftime('%Y-%m-%d')
+        window_rows = self._forecast_by_window.get(ws_key, pd.DataFrame())
+
+        # Slice base (non-price) data from electricity_price_df — preserves original index
+        base_slice = electricity_price_df[
+            (electricity_price_df.index >= start) & (electricity_price_df.index < end)
+        ].copy()
+
+        n_needed = len(base_slice)
+        if window_rows.empty or inputs.forecast_column not in window_rows.columns:
+            raw_forecast = np.zeros(n_needed)
+        else:
+            raw_vals = window_rows[inputs.forecast_column].values[:n_needed]
+            if len(raw_vals) < n_needed:
+                # Pad with last available value if fewer forecast rows than needed
+                pad_val = raw_vals[-1] if len(raw_vals) > 0 else 0.0
+                raw_forecast = np.concatenate([raw_vals, np.full(n_needed - len(raw_vals), pad_val)])
+            else:
+                raw_forecast = raw_vals
+
+        marked_up = self._apply_price_markup(raw_forecast, base_slice)
+        base_slice['Spot_Price1'] = marked_up
+        base_slice['Spot_Price2'] = marked_up
+        return base_slice
+
+    def _build_settlement_price_df(self, electricity_price_df):
+        """Return a copy of electricity_price_df where Spot_Price1/Spot_Price2 are
+        replaced by the DA target values (marked up), used for final cashflow settlement.
+        """
+        max_target_year = self._targets_df['Year'].max()
+
+        settlement_df = electricity_price_df.copy()
+        # Clamp Year for lookup (repeat last available year)
+        settlement_df['_Year_lkp'] = settlement_df['Year'].apply(
+            lambda y: min(int(y), max_target_year)
+        )
+        settlement_df['_Month_lkp'] = settlement_df['Month'].astype(int)
+        settlement_df['_Day_lkp'] = settlement_df['Day'].astype(int)
+        settlement_df['_Hour_lkp'] = settlement_df['Hour'].astype(int)
+
+        targets_slim = self._targets_df[['Year', 'Month', 'Day', 'Hour', inputs.targets_column]].copy()
+        targets_slim = targets_slim.rename(columns={
+            'Year': '_Year_lkp', 'Month': '_Month_lkp',
+            'Day': '_Day_lkp', 'Hour': '_Hour_lkp',
+            inputs.targets_column: '_target_price'
+        })
+        targets_slim['_Month_lkp'] = targets_slim['_Month_lkp'].astype(int)
+        targets_slim['_Day_lkp'] = targets_slim['_Day_lkp'].astype(int)
+        targets_slim['_Hour_lkp'] = targets_slim['_Hour_lkp'].astype(int)
+
+        orig_index = settlement_df.index
+        settlement_df['_orig_idx'] = np.arange(len(settlement_df))
+
+        merged = settlement_df.merge(
+            targets_slim,
+            on=['_Year_lkp', '_Month_lkp', '_Day_lkp', '_Hour_lkp'],
+            how='left'
+        ).sort_values('_orig_idx').reset_index(drop=True)
+        merged.index = orig_index  # restore original index for join compatibility
+
+        raw_prices = merged['_target_price'].fillna(0.0).values
+        marked_up = self._apply_price_markup(raw_prices, merged)
+        merged['Spot_Price1'] = marked_up
+        merged['Spot_Price2'] = marked_up
+
+        merged.drop(columns=['_orig_idx', '_Year_lkp', '_Month_lkp', '_Day_lkp', '_Hour_lkp', '_target_price'],
+                    inplace=True)
+        return merged
+
+    # ------------------------------------------------------------------
+
     def _calculate_cashflow(self, operations_df, weather_data_df, rss_level_max = storage_capacity):
         ## Trading Cashflow
         buy_tax = 1 + self._trading_data_dict['buy_taxes_perc']
