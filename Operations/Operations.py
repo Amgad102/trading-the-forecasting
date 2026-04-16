@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import time
@@ -14,7 +15,11 @@ from MainData.OperationsData import OperationsData
 from Mish.utils import calculate_rss_series, progressbar, get_rate
 from P2P.main_ext import RunMain as P2P_RunMain
 
-from inputs import price_mean_modifier, price_std_modifier, price_minimum , PPA,  PPA_sales, storage_capacity, PROJECT_LIFETIME, YEAR_START, rss_day_0, subsidy_per_mwh, tension_level, electricity_price_forecasting, sample_period_days
+from inputs import (price_mean_modifier, price_std_modifier, price_minimum,
+                    PPA, PPA_sales, storage_capacity, PROJECT_LIFETIME, YEAR_START,
+                    rss_day_0, subsidy_per_mwh, tension_level,
+                    electricity_price_forecasting, sample_period_days,
+                    forecast_file, targets_file, forecast_column, settlement_column)
 import inputs
 
 
@@ -118,6 +123,13 @@ class Operations(object):
                                     rss_capacity=storage_capacity)
 
         self._trading_data_dict = self._trading_obj.get_data_dict()
+
+        ## Load forecast / targets data if forecasting is enabled
+        if electricity_price_forecasting:
+            self._forecast_df = self._load_forecast_data()
+            self._targets_df  = self._load_targets_data()
+            print(f"[Forecasting] Enabled — forecast: {forecast_file}, column: {forecast_column}")
+            print(f"[Forecasting] Settlement file: {targets_file}, column: {settlement_column}")
 
         ## Perform Calculation
         self._number_years_to_calculate = inputs.number_years_to_calculate
@@ -232,9 +244,12 @@ class Operations(object):
                 resource_input_flow_sample_df = resource_input_flow_df[(resource_input_flow_df.index >= start) & (resource_input_flow_df.index < end)]
             weather_data_sample_df = weather_data_df[(weather_data_df.index >= start) & (weather_data_df.index < end)]
 
-            if electricity_price_forecasting == True:    
-                # Run forcasting (from day_count inpot the forcasted_period_df) AMGAD
-                sample_period_df = []
+            if electricity_price_forecasting:
+                # Use forecast prices for trading decisions.
+                # Actual (settlement) prices are applied after the annual loop via targets_file.
+                actual_slice = electricity_price_df[(electricity_price_df.index >= start) & (electricity_price_df.index < end)]
+                sim_date = electricity_price_df.iloc[start]['DateTime'].date()
+                sample_period_df = self._get_forecast_prices_for_day(sim_date, actual_slice)
             else:
                 sample_period_df = electricity_price_df[(electricity_price_df.index >= start) & (electricity_price_df.index < end)]
 
@@ -262,6 +277,12 @@ class Operations(object):
         print('Finalizing annual operations...',  end='\r')
         print(min(annual_consolidated_resource_inlet_flow_list))
         annual_operations_df = self._calculate_aggregated_operations_df(annual_operation_df.copy(), annual_consolidated_resource_inlet_flow_list, annual_consolidated_resource_inlet_power_consumption_list, weather_data_df, rss_year_day_0).join(electricity_price_df)
+
+        # When forecasting is active, replace Spot_Price1/Spot_Price2 with actual settlement
+        # prices from targets_file before computing cashflows.
+        if electricity_price_forecasting:
+            annual_operations_df = self._apply_settlement_prices(annual_operations_df)
+
         water_consumption_list_rcs = self._p2p_main_obj.get_water_consumption_from_rcs() #m3/h
         annual_operations_df["water_consumption_rcs"] = water_consumption_list_rcs
         fuel_consumption_list_rcs = self._p2p_main_obj.get_fuel_consumption_from_rcs() #MWh/h
@@ -270,7 +291,7 @@ class Operations(object):
         annual_operations_df["water_consumption_rps"] = water_consumption_list_rps
         fuel_consumption_list_rps = self._p2p_main_obj.get_fuel_consumption_from_rps() #MWh/h
         annual_operations_df["fuel_consumption_rps"] = fuel_consumption_list_rps
-        
+
         thermal_power_consumption_list = self._p2p_main_obj.get_thermal_power_consumption() #MWht/h
         annual_operations_df["thermal_power_consumption"] = thermal_power_consumption_list
         resource_inlet_list = self._p2p_main_obj.get_actual_resource_inlet_flow_list() #unit/h
@@ -281,6 +302,119 @@ class Operations(object):
         time3 = time.time()
         print('Finalizing annual operations completed in', time3-time2, 'seconds', '\n')
         return annual_operations_df
+
+    # ------------------------------------------------------------------
+    # Forecasting helpers
+    # ------------------------------------------------------------------
+
+    def _load_forecast_data(self):
+        """Load the forecast CSV (168h or 24h model) from MainData/."""
+        path = os.path.join("MainData", forecast_file)
+        df = pd.read_csv(path, parse_dates=['time', 'window_start'])
+        # Normalise window_start to date-only Timestamps for reliable lookup
+        df['window_start'] = df['window_start'].dt.normalize()
+        return df
+
+    def _load_targets_data(self):
+        """Load the targets CSV (actual market prices) from MainData/ for settlement."""
+        path = os.path.join("MainData", targets_file)
+        # targets.csv datetime format is M/D/YYYY H:MM  (e.g. 1/1/2024 0:00)
+        df = pd.read_csv(path)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        return df
+
+    def _get_forecast_prices_for_day(self, sim_date, actual_price_slice):
+        """
+        Build a sample_period_df using forecast prices for trading decisions.
+
+        For each simulation day the matching forecast window is found by
+        window_start == sim_date.  Spot_Price2 (raw sell price) is replaced by
+        the forecast column value; Spot_Price1 (buy price) is adjusted
+        proportionally to preserve any toll/tax premium baked into the
+        original electricity_price_df slice.
+
+        Falls back to actual prices with a warning when no window is found.
+
+        Args:
+            sim_date  : datetime.date — calendar date of the simulation day
+            actual_price_slice : DataFrame slice from electricity_price_df
+        Returns:
+            DataFrame with same index/columns as actual_price_slice
+        """
+        date_key = pd.Timestamp(sim_date)
+        window_df = self._forecast_df[self._forecast_df['window_start'] == date_key]
+
+        if window_df.empty:
+            print(f"[Forecasting] WARNING: no forecast window for {sim_date}; using actual prices.")
+            return actual_price_slice
+
+        n_hours = sample_period_days * 24
+        forecast_prices = window_df.head(n_hours)[forecast_column].values
+
+        if len(forecast_prices) < len(actual_price_slice):
+            print(f"[Forecasting] WARNING: forecast for {sim_date} has only "
+                  f"{len(forecast_prices)} hours (needed {n_hours}); using actual prices.")
+            return actual_price_slice
+
+        sample_df = actual_price_slice.copy()
+        n_rows = len(sample_df)
+
+        # Preserve the buy-price premium (tolls / taxes) from the original data
+        orig_sp2 = actual_price_slice['Spot_Price2'].values
+        orig_sp1 = actual_price_slice['Spot_Price1'].values
+        buy_premium = orig_sp1 - orig_sp2
+
+        sample_df['Spot_Price2'] = forecast_prices[:n_rows]
+        sample_df['Spot_Price1'] = forecast_prices[:n_rows] + buy_premium
+        return sample_df
+
+    def _apply_settlement_prices(self, annual_operations_df):
+        """
+        Replace Spot_Price1/Spot_Price2 in annual_operations_df with actual
+        settlement prices from targets_file.  Called after operations are
+        computed, before cashflow calculation.
+
+        Spot_Price2 (raw sell price) is set to settlement_column from targets.
+        Spot_Price1 (buy price) is updated by the same additive delta so the
+        toll/tax premium is preserved.
+
+        Rows whose datetime is not found in targets fall back to the existing
+        (electricity_price_df) values silently.
+        """
+        df = annual_operations_df.copy()
+
+        # Rebuild datetime from Year/Month/Day/Hour (added via join with electricity_price_df)
+        dt_col = pd.to_datetime({
+            'year':  df['Year'].astype(int),
+            'month': df['Month'].astype(int),
+            'day':   df['Day'].astype(int),
+            'hour':  df['Hour'].astype(int),
+        })
+
+        targets_map = self._targets_df.set_index('datetime')[settlement_column]
+        settlement_prices = pd.Series(
+            [targets_map.get(dt, np.nan) for dt in dt_col],
+            index=df.index,
+            dtype=float,
+        )
+
+        valid_mask = settlement_prices.notna()
+        if valid_mask.any():
+            buy_premium = df['Spot_Price1'] - df['Spot_Price2']
+            df.loc[valid_mask, 'Spot_Price2'] = settlement_prices[valid_mask].values
+            df.loc[valid_mask, 'Spot_Price1'] = (
+                df.loc[valid_mask, 'Spot_Price2'] + buy_premium[valid_mask]
+            )
+            n_matched = valid_mask.sum()
+            print(f"[Forecasting] Settlement prices applied to {n_matched}/{len(df)} hours "
+                  f"from '{settlement_column}' column.")
+        else:
+            print("[Forecasting] WARNING: no settlement prices matched from targets file; "
+                  "cashflow will use forecast prices.")
+
+        return df
+
+    # ------------------------------------------------------------------
 
     def _calculate_aggregated_operations_df(self, origin_operation_df, resource_input_flow, resource_inlet_power_consumption_list,  weather_data_df, rss_start):
         ## calculate production/consuption per minute (before correction by factor of 60)  Note: ~24s

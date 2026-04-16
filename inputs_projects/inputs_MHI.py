@@ -17,10 +17,15 @@ tension_level = "6.3 TD"
 electricity_tax = 5.113 ## %
 margin_tradingcompany_energy = 0 ##EUR/kwh
 margin_tradingcompany_power = 0 ##EUR/kw/year
-sample_period_days  = 7
+sample_period_days  = 1       ## days the optimizer looks ahead; 1–7 for 168h forecast file, must be 1 for 24h file
 number_years_to_calculate = 1
 is_cost_driven = False
 electricity_price_forecasting = False
+## Forecasting settings (used when electricity_price_forecasting = True):
+forecast_file      = "G_T_all_hourly_forecasts_168h_model_no_feb29.csv"  ## forecast file in MainData/
+targets_file       = "targets.csv"     ## actual-price file in MainData/ (used for cashflow settlement)
+forecast_column    = "T1"             ## column for trading decisions: T1 / G1 / G4 (168h) or DA_forecast (24h)
+settlement_column  = "DA"             ## column from targets_file used to settle cashflows
 
 ## SYSTEM GENERAL SPECIFICATIONS:
 unit = "kg H2"
