@@ -20,11 +20,16 @@ tension_level = "6.3 TD"
 electricity_tax = 5.113 ## %
 margin_tradingcompany_energy = 0 ##EUR/kwh
 margin_tradingcompany_power = 0 ##EUR/kw/year
-sample_period_days  = 7
+sample_period_days  = 1  ## days; for 168h forecast model use 1–7, for 24h model use 1
 rcs_maximum_idle_time = 0 #hours
 number_years_to_calculate = 1
 is_cost_driven = False
 electricity_price_forecasting = False
+## Forecasting settings (used when electricity_price_forecasting = True):
+forecast_file = "G_T_all_hourly_forecasts_168h_model_no_feb29.csv"  ## path relative to MainData/
+targets_file = "targets.csv"                                          ## path relative to MainData/
+forecast_column = "T1"      ## column in forecast_file used for trading decisions (e.g. "T1", "G1", "G4", "DA_forecast")
+settlement_column = "DA"    ## column in targets_file used for settlement (actual price)
 
 ## SYSTEM GENERAL SPECIFICATIONS:
 unit = "kg H2"
