@@ -1,0 +1,10 @@
+EconomicAnalysis Report:
+Investment year 0 (Equity):	122388503.99944317 Eur
+Simple Payback Period:	-12.986873385076843
+Discounted Payback Period:	-2025
+Net Present Value (Year 30):	-214059326.9409036
+Internal Rate of Return:	nan
+Modified Internal Rate of Return:	nan
+LCOE:	147.6287841796875 Eur
+Subsidy per MWh:	32.186755232048185 Eur/MWh
+Annual Subsidy:	23.9149392189599 M Eur/year

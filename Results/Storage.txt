@@ -1,0 +1,8 @@
+The 100th percentile of the storage is: 1472730.0 unit
+The 95th percentile of the storage is: 841560.0 unit
+The 90th percentile of the storage is: 631170.0 unit
+The 85th percentile of the storage is: 420780.0 unit
+The 80th percentile of the storage is: 210390.0 unit
+The 75th percentile of the storage is: 0.0 unit
+The 70th percentile of the storage is: 0.0 unit
+The 50th percentile of the storage is: 0.0 unit
